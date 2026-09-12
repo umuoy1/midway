@@ -76,6 +76,17 @@ describe('/test/definitions/objectCreator.test.ts', () => {
     }, mockContext);
     expect(callback.withArgs('doInitAsync cb1').calledOnce).toBeTruthy();
 
+    // Class initializer return values are not exposed by the public creator API.
+    await expect(creator.doInitAsync({
+      say() { return 'ignored'; }
+    }, mockContext)).resolves.toBeUndefined();
+    await expect(creator.doInitAsync({
+      async say() { return 'ignored'; }
+    }, mockContext)).resolves.toBeUndefined();
+    await expect(creator.doInitAsync({
+      say(cb) { cb('ignored'); }
+    }, mockContext)).resolves.toBeUndefined();
+
     definition.destroyMethod = 'destroy';
     creator.doDestroy({
       destroy() {

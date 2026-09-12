@@ -95,20 +95,25 @@ export class ObjectCreator implements IObjectCreator {
    * @returns {void}
    */
   async doInitAsync(obj: any, context: IMidwayContainer): Promise<any> {
-    const inst = obj;
-    if (this.definition.initMethod && inst[this.definition.initMethod]) {
-      const initFn = inst[this.definition.initMethod];
-      if (Types.isAsyncFunction(initFn)) {
-        await initFn.call(inst);
-      } else {
-        if (initFn.length === 1) {
-          await new Promise(resolve => {
-            initFn.call(inst, resolve);
-          });
-        } else {
-          initFn.call(inst);
-        }
-      }
+    return this.initialize(obj, context);
+  }
+
+  /**
+   * Invoke initialization without introducing an await for synchronous methods.
+   * @internal
+   */
+  initialize(obj: any, context: IMidwayContainer): any {
+    if (!this.definition.initMethod) return;
+    const initFn = obj[this.definition.initMethod];
+    if (!initFn) return;
+    if (!Types.isAsyncFunction(initFn) && initFn.length === 1) {
+      return new Promise<void>(resolve => {
+        initFn.call(obj, () => resolve());
+      });
+    }
+    const result = initFn.call(obj);
+    if (Types.isPromise(result)) {
+      return result.then(() => {});
     }
   }
 

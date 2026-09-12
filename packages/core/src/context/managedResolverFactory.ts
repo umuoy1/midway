@@ -4,7 +4,6 @@
 import {
   CONTAINER_OBJ_SCOPE,
   REQUEST_CTX_KEY,
-  REQUEST_CTX_UNIQUE_KEY,
   REQUEST_OBJ_CTX_KEY,
   SINGLETON_CONTAINER_CTX,
 } from '../constants';
@@ -24,8 +23,11 @@ import {
   MidwayCommonError,
   MidwayDefinitionNotFoundError,
   MidwaySingletonInjectRequestError,
+  MidwayUseWrongMethodError,
 } from '../error';
 import { FunctionDefinition } from '../definitions/functionDefinition';
+import { ObjectCreator } from '../definitions/objectCreator';
+import { Types } from '../util/types';
 
 const debug = util.debuglog('midway:debug');
 
@@ -53,11 +55,36 @@ function formatObjectIdentifier(
   return identifier;
 }
 
+/** One entry in the existing dependency-first initialization queue. */
+interface PendingInitialization {
+  instance: any;
+  definition: IObjectDefinition;
+  context: IMidwayContainer;
+  init: () => any;
+  replaceCallback?: (value: any) => void;
+  creation?: ObjectCreation;
+  shared?: boolean;
+}
+
+/** Completion shared by queue entries, also reserved globally for singletons. */
+interface ObjectCreation {
+  definition: IObjectDefinition;
+  instance?: any;
+  queue?: PendingInitialization[];
+  promise: Promise<any>;
+  resolve: (value: any) => void;
+  reject: (error: any) => void;
+  initializing?: boolean;
+  result?: { value: any };
+  failure?: { error: any };
+}
+
 /**
  * 解析工厂
  */
 export class ManagedResolverFactory {
-  private creating = new Map<string, boolean>();
+  private creating = new Map<string, ObjectCreation>();
+  private singletonCacheIds = new Set<string>();
   context: IMidwayGlobalContainer;
 
   constructor(context: IMidwayGlobalContainer) {
@@ -97,28 +124,31 @@ export class ManagedResolverFactory {
       throw new MidwayDefinitionNotFoundError(identifier, name);
     }
 
-    const pendingInitQueue: Array<
-      [any, IObjectDefinition, () => any, (newValue: any) => void]
-    > = [];
+    const pendingInitQueue: PendingInitialization[] = [];
     const pendingObjectCache = new Map<string, any>();
-    const instance = this.createInstance(
-      identifier,
-      name,
-      args,
-      definition,
-      false,
-      false,
-      currentContext,
-      pendingObjectCache,
-      pendingInitQueue
-    );
-    pendingObjectCache.clear();
-    const newInstance = this.initializeInstance(
-      instance,
-      definition,
-      pendingInitQueue
-    );
-    return newInstance ?? instance;
+    const ownedCreations = new Set<ObjectCreation>();
+    try {
+      const instance = this.createInstance(
+        identifier,
+        name,
+        args,
+        definition,
+        false,
+        false,
+        currentContext,
+        pendingObjectCache,
+        pendingInitQueue,
+        ownedCreations
+      );
+      return this.initializeInstance(instance, definition, pendingInitQueue);
+    } catch (error) {
+      for (const creation of ownedCreations) {
+        if (!creation.initializing) this.failCreation(creation, error);
+      }
+      throw error;
+    } finally {
+      pendingObjectCache.clear();
+    }
   }
 
   async createAsync<T = any>(
@@ -148,34 +178,58 @@ export class ManagedResolverFactory {
       throw new MidwayDefinitionNotFoundError(identifier, name);
     }
 
-    const pendingInitQueue: Array<
-      [any, IObjectDefinition, () => Promise<any>, (newValue: any) => void]
-    > = [];
+    const creation = this.isGlobalScope(definition, currentContext)
+      ? this.creating.get(definition.id)
+      : undefined;
+    if (creation) {
+      return creation.queue
+        ? this.initializeInstanceAsync(
+            creation.instance,
+            definition,
+            creation.queue
+          )
+        : creation.promise;
+    }
+
+    const pendingInitQueue: PendingInitialization[] = [];
     const pendingObjectCache = new Map<string, any>();
-    const instance = this.createInstance(
-      identifier,
-      definition?.name ?? name,
-      args,
-      definition,
-      true,
-      false,
-      currentContext,
-      pendingObjectCache,
-      pendingInitQueue
-    );
-    pendingObjectCache.clear();
-    const newInstance = await this.initializeInstanceAsync(
-      instance,
-      definition,
-      pendingInitQueue
-    );
-    return newInstance ?? instance;
+    const ownedCreations = new Set<ObjectCreation>();
+    try {
+      const instance = this.createInstance(
+        identifier,
+        definition.name ?? name,
+        args,
+        definition,
+        true,
+        false,
+        currentContext,
+        pendingObjectCache,
+        pendingInitQueue,
+        ownedCreations
+      );
+      return await this.initializeInstanceAsync(
+        instance,
+        definition,
+        pendingInitQueue
+      );
+    } catch (error) {
+      for (const creation of ownedCreations) {
+        if (!creation.initializing) this.failCreation(creation, error);
+      }
+      throw error;
+    } finally {
+      pendingObjectCache.clear();
+    }
   }
 
   async destroyCache(): Promise<void> {
-    for (const key of this.context.registry.getSingletonDefinitionIds()) {
+    const ids = new Set([
+      ...this.context.registry.getSingletonDefinitionIds(),
+      ...this.singletonCacheIds,
+    ]);
+    for (const key of ids) {
       const definition = this.getObjectDefinition(key);
-      if (definition.creator) {
+      if (definition?.creator) {
         const inst = this.context.getObject(key);
         this.getObjectEventTarget().emit(
           ObjectLifeCycleEvent.BEFORE_DESTROY,
@@ -192,6 +246,7 @@ export class ManagedResolverFactory {
     }
 
     this.creating.clear();
+    this.singletonCacheIds.clear();
   }
 
   private getObjectEventTarget(): EventEmitter {
@@ -218,7 +273,7 @@ export class ManagedResolverFactory {
   }
 
   private setInstanceScope(inst, scope: ScopeEnum) {
-    if (typeof inst === 'object') {
+    if (inst && typeof inst === 'object') {
       if (
         scope === ScopeEnum.Request &&
         inst[REQUEST_OBJ_CTX_KEY] === SINGLETON_CONTAINER_CTX
@@ -243,9 +298,8 @@ export class ManagedResolverFactory {
     isLazyInject: boolean,
     currentContext: IMidwayContainer,
     pendingObjectCache: Map<string, any>,
-    pendingInitQueue: Array<
-      [any, IObjectDefinition, () => any, (newValue: any) => void]
-    >,
+    pendingInitQueue: PendingInitialization[],
+    ownedCreations: Set<ObjectCreation>,
     creationPath: Set<string> = new Set(),
     replaceCallback?: (newValue: any) => void
   ): any {
@@ -280,12 +334,6 @@ export class ManagedResolverFactory {
         );
         return this.context.getObject(definition.id);
       }
-      // if (this.singletonCache.has(definition.id)) {
-      //   debug(
-      //     `[core]: "${definition.id}(${definition.name})" get from singleton cache.`
-      //   );
-      //   return this.singletonCache.get(definition.id);
-      // }
     }
 
     // 使用 creationPath 检查循环依赖
@@ -304,10 +352,45 @@ export class ManagedResolverFactory {
       }
     }
 
+    const shared = this.isGlobalScope(definition, currentContext)
+      ? this.creating.get(definition.id)
+      : undefined;
+    if (shared) {
+      pendingInitQueue.push({
+        instance: shared.instance,
+        definition,
+        context: currentContext,
+        shared: true,
+        replaceCallback,
+        init: () => {
+          if (shared.failure) throw shared.failure.error;
+          if (shared.result) return shared.result.value;
+          if (!shared.queue) return shared.promise;
+          return isAsync
+            ? this.initializeInstanceAsync(
+                shared.instance,
+                definition,
+                shared.queue
+              )
+            : this.initializeInstance(
+                shared.instance,
+                definition,
+                shared.queue
+              );
+        },
+      });
+      return shared.instance;
+    }
+
     if (pendingObjectCache.has(definition.id)) {
       return pendingObjectCache.get(definition.id);
     }
 
+    const queueStart = pendingInitQueue.length;
+    const creation = this.isGlobalScope(definition, currentContext)
+      ? this.reserveCreation(definition)
+      : undefined;
+    if (creation) ownedCreations.add(creation);
     creationPath.add(definition.id);
 
     // Pre-initialize dependencies
@@ -324,6 +407,7 @@ export class ManagedResolverFactory {
           currentContext,
           pendingObjectCache,
           pendingInitQueue,
+          ownedCreations,
           new Set(creationPath)
         );
       }
@@ -360,6 +444,7 @@ export class ManagedResolverFactory {
           currentContext,
           pendingObjectCache,
           pendingInitQueue,
+          ownedCreations,
           new Set(creationPath)
         );
       }
@@ -399,6 +484,7 @@ export class ManagedResolverFactory {
     }
 
     pendingObjectCache.set(definition.id, inst);
+    if (creation) creation.instance = inst;
 
     // Set properties
     if (definition.properties) {
@@ -435,6 +521,7 @@ export class ManagedResolverFactory {
           currentContext,
           pendingObjectCache,
           pendingInitQueue,
+          ownedCreations,
           new Set(creationPath),
           newValue => {
             inst[key] = newValue;
@@ -457,22 +544,31 @@ export class ManagedResolverFactory {
       definition.name
     );
 
-    // Set init function to pending init queue
-    if (isAsync) {
-      pendingInitQueue.push([
-        inst,
-        definition,
-        () => definition.creator.doInitAsync(inst, currentContext),
-        replaceCallback,
-      ]);
-    } else {
-      pendingInitQueue.push([
-        inst,
-        definition,
-        () => definition.creator.doInit(inst, currentContext),
-        replaceCallback,
-      ]);
-    }
+    // Capture the replaced instance before another resolution can reuse it.
+    pendingObjectCache.set(definition.id, inst);
+    if (creation) creation.instance = inst;
+    pendingInitQueue.push({
+      instance: inst,
+      definition,
+      context: currentContext,
+      // Queue slices share entries, including non-singleton dependencies.
+      creation: creation ?? this.createCompletion(definition),
+      replaceCallback,
+      init: () => {
+        const creator = definition.creator;
+        if (!isAsync) return creator.doInit(inst, currentContext);
+        // Keep synchronous initialization synchronous, without changing the
+        // public async creator API or bypassing custom creator overrides.
+        if (
+          creator instanceof ObjectCreator &&
+          creator.doInitAsync === ObjectCreator.prototype.doInitAsync
+        ) {
+          return creator.initialize(inst, currentContext);
+        }
+        return creator.doInitAsync(inst, currentContext);
+      },
+    });
+    if (creation) creation.queue = pendingInitQueue.slice(queueStart);
 
     return inst;
   }
@@ -480,138 +576,192 @@ export class ManagedResolverFactory {
   private initializeInstance(
     instance: any,
     targetDefinition: IObjectDefinition,
-    pendingInitQueue: Array<
-      [any, IObjectDefinition, () => any, (newValue: any) => void]
-    >
+    pendingInitQueue: PendingInitialization[]
   ): any {
-    const initializingSet = new Map<string, any>();
     const initializedInstances = new Map<string, any>();
-
-    for (const [
-      obj,
-      definition,
-      initFunc,
-      replaceCallback,
-    ] of pendingInitQueue) {
-      if (!initializedInstances.has(definition.id)) {
-        initializingSet.set(definition.id, obj);
-
-        debug(
-          '[core]: load "%s(%s)" from pending init queue and ready to init.',
-          definition.id,
-          definition.name
-        );
-
-        const res = initFunc?.();
-        if (definition instanceof FunctionDefinition) {
-          initializedInstances.set(definition.id, res);
-          replaceCallback?.(res);
-        } else {
-          initializedInstances.set(definition.id, obj);
-        }
-        this.storeInstanceScope(obj, definition);
-        this.getObjectEventTarget().emit(
-          ObjectLifeCycleEvent.AFTER_INIT,
-          instance,
-          {
-            context: this.getCurrentMatchedContext(instance),
-            definition,
-          }
-        );
-        initializingSet.delete(definition.id);
+    for (const entry of pendingInitQueue) {
+      if (!initializedInstances.has(entry.definition.id)) {
+        const value = this.initializeEntry(entry, false);
+        initializedInstances.set(entry.definition.id, value);
+      } else {
+        entry.replaceCallback?.(initializedInstances.get(entry.definition.id));
       }
     }
-
-    return initializedInstances.get(targetDefinition.id);
+    return initializedInstances.has(targetDefinition.id)
+      ? initializedInstances.get(targetDefinition.id)
+      : instance;
   }
 
   private async initializeInstanceAsync(
     instance: any,
     targetDefinition: IObjectDefinition,
-    pendingInitQueue: Array<
-      [any, IObjectDefinition, () => Promise<void>, (newValue: any) => void]
-    >
+    pendingInitQueue: PendingInitialization[]
   ): Promise<any> {
-    const initializingSet = new Map<string, any>();
     const initializedInstances = new Map<string, any>();
-
-    for (const [
-      obj,
-      definition,
-      initFunc,
-      replaceCallback,
-    ] of pendingInitQueue) {
-      if (!initializedInstances.has(definition.id)) {
-        initializingSet.set(definition.id, obj);
-
-        debug(
-          '[core]: load "%s(%s)" from pending init queue and ready to init.',
-          definition.id,
-          definition.name
-        );
-
-        const res = await initFunc();
-        if (definition instanceof FunctionDefinition) {
-          initializedInstances.set(definition.id, res);
-          replaceCallback?.(res);
+    try {
+      for (const entry of pendingInitQueue) {
+        if (!initializedInstances.has(entry.definition.id)) {
+          const value = this.initializeEntry(entry, true);
+          initializedInstances.set(
+            entry.definition.id,
+            Types.isPromise(value) ? await value : value
+          );
         } else {
-          initializedInstances.set(definition.id, obj);
+          entry.replaceCallback?.(
+            initializedInstances.get(entry.definition.id)
+          );
         }
-        this.storeInstanceScope(obj, definition);
-        this.getObjectEventTarget().emit(
-          ObjectLifeCycleEvent.AFTER_INIT,
-          instance,
-          {
-            context: this.getCurrentMatchedContext(instance),
-            definition,
-          }
-        );
-        initializingSet.delete(definition.id);
       }
+      return initializedInstances.has(targetDefinition.id)
+        ? initializedInstances.get(targetDefinition.id)
+        : instance;
+    } catch (error) {
+      // Release entries that cannot start. An initializer already running in
+      // another resolution remains responsible for its own completion.
+      for (const entry of pendingInitQueue) {
+        if (entry.creation && !entry.creation.initializing) {
+          this.failCreation(entry.creation, error);
+        }
+      }
+      throw error;
     }
+  }
 
-    return initializedInstances.get(targetDefinition.id);
+  /** Execute an owned initializer once, or wait for its existing result. */
+  private initializeEntry(entry: PendingInitialization, isAsync: boolean): any {
+    const { creation, definition } = entry;
+    if (creation?.failure) throw creation.failure.error;
+    if (creation?.result) return creation.result.value;
+    if (creation?.initializing) {
+      if (isAsync || definition instanceof FunctionDefinition)
+        return creation.promise;
+      throw new MidwayUseWrongMethodError(
+        'context.get',
+        'context.getAsync',
+        definition.id
+      );
+    }
+    if (creation) creation.initializing = true;
+
+    const finish = (result: any) => {
+      if (entry.shared) {
+        entry.replaceCallback?.(result);
+        return result;
+      }
+      const value =
+        definition instanceof FunctionDefinition ? result : entry.instance;
+      entry.replaceCallback?.(value);
+      this.storeInstanceScope(value, definition, entry.context);
+      this.getObjectEventTarget().emit(ObjectLifeCycleEvent.AFTER_INIT, value, {
+        context: entry.context,
+        definition,
+      });
+      if (creation) {
+        creation.result = { value };
+        creation.resolve(value);
+        this.releaseCreation(creation);
+      }
+      return value;
+    };
+
+    try {
+      const result = entry.init();
+      if (Types.isPromise(result)) {
+        if (!isAsync && !(definition instanceof FunctionDefinition)) {
+          throw new MidwayUseWrongMethodError(
+            'context.get',
+            'context.getAsync',
+            definition.id
+          );
+        }
+        return result.then(finish).catch(error => {
+          if (creation) this.failCreation(creation, error);
+          throw error;
+        });
+      }
+      return finish(result);
+    } catch (error) {
+      if (creation) this.failCreation(creation, error);
+      throw error;
+    }
+  }
+
+  /** Resolve cache ownership without promoting actual request or prototype values. */
+  private isGlobalScope(
+    definition: IObjectDefinition,
+    context: IMidwayContainer
+  ): boolean {
+    return (
+      definition.isSingletonScope() ||
+      (definition.isRequestScope() && context === this.context)
+    );
+  }
+
+  /** Reserve before calling constructors or providers, including synchronous reentry. */
+  private reserveCreation(definition: IObjectDefinition): ObjectCreation {
+    const creation = this.createCompletion(definition);
+    this.creating.set(definition.id, creation);
+    return creation;
+  }
+
+  /** Keep repeated visits to the same queue entry on one initialization. */
+  private createCompletion(definition: IObjectDefinition): ObjectCreation {
+    let resolve: (value: any) => void;
+    let reject: (error: any) => void;
+    const promise = new Promise<any>((done, fail) => {
+      resolve = done;
+      reject = fail;
+    });
+    // A creation can fail before any waiter joins. The resolving API still
+    // propagates the original error; this internal promise must be observed too.
+    promise.catch(() => {});
+    return { definition, promise, resolve, reject };
+  }
+
+  /** Remove only this attempt, so its cleanup cannot erase a later resolution. */
+  private releaseCreation(creation: ObjectCreation): void {
+    if (this.creating.get(creation.definition.id) === creation) {
+      this.creating.delete(creation.definition.id);
+    }
+    creation.queue = undefined;
+  }
+
+  /** Reject unfinished owners and release their temporary construction records. */
+  private failCreation(creation: ObjectCreation, error: any): void {
+    if (creation.result || creation.failure) return;
+    creation.failure = { error };
+    creation.reject(error);
+    this.releaseCreation(creation);
   }
 
   private storeInstanceScope(
     instance: any,
-    definition: IObjectDefinition
+    definition: IObjectDefinition,
+    context: IMidwayContainer
   ): void {
-    if (definition.id) {
-      if (definition.isSingletonScope()) {
-        debug(
-          `[core]: "${definition.id}(${definition.name})" set to singleton cache`
-        );
-        this.context.registerObject(definition.id, instance);
-        // this.singletonCache.set(definition.id, instance);
-        this.setInstanceScope(instance, ScopeEnum.Singleton);
-      } else if (definition.isRequestScope()) {
-        debug(
-          `[core]: "${definition.id}(${definition.name})" set to register object`
-        );
-        this.getCurrentMatchedContext(instance).registerObject(
-          definition.id,
-          instance
-        );
-        this.setInstanceScope(instance, ScopeEnum.Request);
-      } else {
-        this.setInstanceScope(instance, ScopeEnum.Prototype);
-      }
+    if (!definition.id) return;
+    if (this.isGlobalScope(definition, context)) {
+      this.context.registerObject(definition.id, instance);
+      this.singletonCacheIds.add(definition.id);
+    } else if (definition.isRequestScope()) {
+      context.registerObject(definition.id, instance);
+    }
+    // A factory may return an existing object, a primitive or a function.
+    // Its cache ownership comes from the provider, not from mutating that value.
+    if (!(definition instanceof FunctionDefinition)) {
+      this.setInstanceScope(
+        instance,
+        definition.isSingletonScope()
+          ? ScopeEnum.Singleton
+          : definition.isRequestScope()
+            ? ScopeEnum.Request
+            : ScopeEnum.Prototype
+      );
     }
   }
 
   private getObjectDefinition(identifier: ObjectIdentifier): IObjectDefinition {
     return this.context.getDefinition(identifier);
-  }
-
-  private getCurrentMatchedContext(instance): IMidwayContainer {
-    if (instance[REQUEST_OBJ_CTX_KEY]) {
-      return (
-        instance[REQUEST_OBJ_CTX_KEY]?.[REQUEST_CTX_UNIQUE_KEY] ?? this.context
-      );
-    }
-
-    return this.context;
   }
 
   private translateIdentifiers(ids: string[]) {

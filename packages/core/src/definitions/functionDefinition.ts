@@ -17,7 +17,8 @@ class FunctionWrapperCreator extends ObjectCreator {
     return obj(context);
   }
 
-  async doInitAsync(obj: any, context: IMidwayContainer): Promise<void> {
+  /** Execute the provider once, preserving synchronous completion. @internal */
+  initialize(obj: any, context: IMidwayContainer): any {
     return obj(context);
   }
 }
